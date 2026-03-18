@@ -1,0 +1,8 @@
+LICENSE
+README.md
+setup.py
+reqap.egg-info/PKG-INFO
+reqap.egg-info/SOURCES.txt
+reqap.egg-info/dependency_links.txt
+reqap.egg-info/requires.txt
+reqap.egg-info/top_level.txt
