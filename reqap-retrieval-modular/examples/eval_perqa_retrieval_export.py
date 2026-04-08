@@ -250,11 +250,6 @@ def main() -> None:
     ap.add_argument("--dense-index", default="", help="Override dense FAISS index dir")
     ap.add_argument("--bm25-index", default="", help="Override BM25 index dir")
     ap.add_argument(
-        "--dense-model",
-        default="",
-        help="Dense encoder model type/path (overrides PERQA_DENSE_MODEL_TYPE_OR_PATH).",
-    )
-    ap.add_argument(
         "--qu-jsonl",
         default="",
         help="QU jsonl for Dynamic Fusion retrieve counts (default: reqap_sft qu_result for split/persona)",
@@ -297,8 +292,6 @@ def main() -> None:
     for label, p in [("splade_index", splade_index), ("dense_index", dense_index), ("bm25_index", bm25_index)]:
         if not os.path.isdir(p):
             raise SystemExit(f"Missing index directory ({label}): {p}")
-
-    dense_model = os.environ.get("PERQA_DENSE_MODEL_TYPE_OR_PATH") or args.dense_model or "sentence-transformers/all-MiniLM-L6-v2"
 
     repo = reqap_main_root()
     folder = persona_folder_name(args.split, args.persona_id)
@@ -348,7 +341,7 @@ def main() -> None:
     splade = SpladeRetriever(sparse, involve_model=True)
 
     dense_cfg = {
-        "dense_model_type_or_path": dense_model,
+        "dense_model_type_or_path": "sentence-transformers/all-MiniLM-L6-v2",
         "use_sentence_transformers": True,
     }
     dense_native = DenseRetrieval(dense_config=dense_cfg, collection=collection, dense_index_path=dense_index)
@@ -364,7 +357,7 @@ def main() -> None:
         splade=splade, collection=collection, bm25_index_dir=bm25_index, weight_splade=0.7, weight_bm25=0.3
     )
     p_splade_dense_fix = SpladeDenseParallelFusion(splade=splade, dense=dense, weight_splade=0.7, weight_dense=0.3)
-    splade_then_dense = SpladeThenDenseRerank(splade=splade, dense_model_name=dense_model)
+    splade_then_dense = SpladeThenDenseRerank(splade=splade)
     dynamic = DynamicFusionOurs(
         splade=splade,
         dense=dense,

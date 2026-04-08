@@ -1,12 +1,25 @@
 import os
 import sys
 
+_EXAMPLES = os.path.abspath(os.path.dirname(__file__))
+# Workspace root = parent of reqap-retrieval-modular (contains ReQAP-main + reqap-retrieval-modular)
+_WORKSPACE_ROOT = os.path.abspath(os.path.join(_EXAMPLES, "..", ".."))
+_REQAP_MAIN = os.path.join(_WORKSPACE_ROOT, "ReQAP-main")
+
 # Make both sibling folders importable:
-# - original package:   ./ReQAP-main
-# - this package:       ./reqap-retrieval-modular
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(ROOT, "ReQAP-main"))
-sys.path.insert(0, os.path.join(ROOT, "reqap-retrieval-modular"))
+# - original package:   ReQAP-main/
+# - this package:       reqap-retrieval-modular/
+sys.path.insert(0, _REQAP_MAIN)
+sys.path.insert(0, os.path.join(_WORKSPACE_ROOT, "reqap-retrieval-modular"))
+if _EXAMPLES not in sys.path:
+    sys.path.insert(0, _EXAMPLES)
+
+from perqa_benchmark_paths import (
+    perqa_bm25_index_dir,
+    perqa_dense_index_dir,
+    perqa_obs_csv,
+    perqa_splade_index_dir,
+)
 
 from omegaconf import OmegaConf
 from loguru import logger
@@ -21,11 +34,20 @@ from reqap_modular_retrieval.pipelines import BM25ThenDenseRerank, SpladeDensePa
 
 
 def main():
-    # Adjust these paths for your persona/split
-    obs_events_csv_path = r".\ReQAP-main\data\perqa\dev\persona_0\persona_0_obs.csv"
-    splade_index_path = r".\ReQAP-main\indices\splade\persona_0.splade_index"
-    dense_index_path = r".\ReQAP-main\indices\dense\persona_0.dense_index"
-    bm25_index_path = r".\ReQAP-main\indices\bm25\persona_0.bm25_index"
+    # Official PerQA obs + indices: ReQAP-main/data/data/...
+    split = os.environ.get("PERQA_SPLIT", "dev")
+    persona_id = int(os.environ.get("PERQA_PERSONA_ID", "0"))
+
+    obs_events_csv_path = os.environ.get("PERQA_OBS_CSV", str(perqa_obs_csv(split, persona_id)))
+    splade_index_path = os.environ.get(
+        "PERQA_SPLADE_INDEX", str(perqa_splade_index_dir(split, persona_id))
+    )
+    dense_index_path = os.environ.get(
+        "PERQA_DENSE_INDEX", str(perqa_dense_index_dir(split, persona_id))
+    )
+    bm25_index_path = os.environ.get(
+        "PERQA_BM25_INDEX", str(perqa_bm25_index_dir(split, persona_id))
+    )
 
     # Minimal SPLADE config (tokenizer/max_length used in model)
     splade_cfg = OmegaConf.create(
