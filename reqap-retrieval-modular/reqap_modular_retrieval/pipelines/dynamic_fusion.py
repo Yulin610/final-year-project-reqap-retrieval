@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 from loguru import logger
 
 from ..core.types import RetrievedDoc
-from ..retrievers.bm25 import default_event_to_text
+from ..fusion.rrf import rrf_fuse
+from ..fusion.weighted_rrf import weighted_rrf_fuse
 from ..retrievers.bm25 import BM25Retriever
 from ..retrievers.dense_adapter import DenseFaissRetriever
 from ..retrievers.splade_adapter import SpladeRetriever
@@ -16,36 +18,64 @@ from .splade_then_dense import SpladeThenDenseRerank
 @dataclass
 class DynamicFusionOurs:
     """
-    Clean fusion (no Cross-Encoder):
-    1) Parallel pre-retrieval: Dense/SPLADE topK=200 each, union by id.
-    2) Local fusion on top_k_semantic (default 100) by backbone ranking:
-       - Reciprocal Rank Fusion (RRF) over ranks from each retriever:
-         score(d) = Σ_i 1 / (k + rank_i(d))
-    3) return top_k_final
+    Query-frequency–aware routing (counts from QU dataset RETRIEVE(query=...)):
+    - High-frequency: SPLADE || Dense parallel, fusion = Weighted RRF with dense:sparse = 7:3;
+      semantic cache (sentence-transformer embedding similarity, LRU) for paraphrase hits.
+    - Low-frequency: BM25 coarse recall → dense ST rerank on candidates → RRF(bm25, dense_rerank).
     """
 
     splade: SpladeRetriever
     dense: DenseFaissRetriever
     bm25: BM25Retriever
     splade_then_dense: SpladeThenDenseRerank
-    retrieve_counts: Dict[str, int]  # kept for API compatibility
+    retrieve_counts: Dict[str, int]
+    freq_percentile_threshold: float = 75.0
+    cache_max: int = 256
+    semantic_cache_threshold: float = 0.88
 
-    # Stage sizes
-    top_k_candidates: int = 1000
-    top_k_semantic: int = 100
+    weight_dense_high: float = 0.3
+    weight_splade_high: float = 0.7
+    wrrf_k: int = 60
 
-    # RRF constant (larger -> flatter; typical 60)
-    rrf_k: int = 60
+    _sem_cache: List[Tuple[np.ndarray, List[RetrievedDoc]]] = field(default_factory=list)
+    _threshold: Optional[float] = field(default=None, init=False)
 
-    @staticmethod
-    def _normalize(score_map: Dict[int, float]) -> Dict[int, float]:
-        if not score_map:
-            return {}
-        vals = list(score_map.values())
-        v_min = min(vals)
-        v_max = max(vals)
-        denom = (v_max - v_min) + 1e-8
-        return {doc_id: (v - v_min) / denom for doc_id, v in score_map.items()}
+    def __post_init__(self):
+        vals = sorted(self.retrieve_counts.values())
+        if not vals:
+            self._threshold = float("inf")
+        else:
+            self._threshold = float(
+                np.percentile(np.array(vals, dtype=np.float64), self.freq_percentile_threshold)
+            )
+
+    def _is_high_freq(self, query_key: str) -> bool:
+        c = self.retrieve_counts.get(query_key.strip(), 0)
+        return c >= self._threshold and c > 0
+
+    def _sem_cache_get(self, q_emb: np.ndarray) -> Optional[List[RetrievedDoc]]:
+        q = q_emb.astype("float32").reshape(-1)
+        n = float(np.linalg.norm(q) + 1e-12)
+        q = q / n
+        best_i = -1
+        best_sim = -1.0
+        for i, (e, _) in enumerate(self._sem_cache):
+            sim = float(np.dot(q, e.reshape(-1)))
+            if sim > best_sim:
+                best_sim = sim
+                best_i = i
+        if best_i < 0 or best_sim < self.semantic_cache_threshold:
+            return None
+        entry = self._sem_cache.pop(best_i)
+        self._sem_cache.append(entry)
+        return list(entry[1])
+
+    def _sem_cache_put(self, q_emb: np.ndarray, docs: List[RetrievedDoc]) -> None:
+        q = q_emb.astype("float32").reshape(-1)
+        q = q / (np.linalg.norm(q) + 1e-12)
+        self._sem_cache.append((q.copy(), list(docs)))
+        while len(self._sem_cache) > self.cache_max:
+            self._sem_cache.pop(0)
 
     def retrieve(
         self,
@@ -54,95 +84,36 @@ class DynamicFusionOurs:
         query_key: str,
         top_k_splade: int = 500,
         top_k_dense: int = 500,
-        top_k_bm25_cold: int = 1000,
+        top_k_bm25_cold: int = 200,
         top_k_final: int = 100,
         threshold_splade: float = 0.0,
         threshold_dense: float = 0.0,
     ) -> List[RetrievedDoc]:
-        _ = query_key  # intentionally unused in this fixed strategy
-        _ = top_k_splade, top_k_dense  # kept for compatibility
+        high = self._is_high_freq(query_key)
 
-        # Stage 1: parallel pre-retrieval from Dense / SPLADE (wider candidate pool)
-        # 用户需求: 去掉 BM25，仅做 RRF(Dense + SPLADE), k=60
-        pre_k = 200
-        dense_docs = self.dense.retrieve(query, top_k=pre_k, threshold=threshold_dense)
-        splade_docs_for_pool = self.splade.retrieve(query, top_k=pre_k, threshold=threshold_splade)
+        if high:
+            q_emb = self.splade_then_dense.encode_query(query)
+            hit = self._sem_cache_get(q_emb)
+            if hit is not None:
+                return hit[:top_k_final] if top_k_final else hit
 
-        if not dense_docs and not splade_docs_for_pool:
-            return []
+            splade_docs = self.splade.retrieve(query, top_k=top_k_splade, threshold=threshold_splade)
+            dense_docs = self.dense.retrieve(query, top_k=top_k_dense, threshold=threshold_dense)
 
-        # union by id,合并来自两路的 signals/derivation
-        merged: Dict[int, RetrievedDoc] = {}
-        for d in dense_docs:
-            merged[d.id] = d
-        for d in splade_docs_for_pool:
-            if d.id in merged:
-                base = merged[d.id]
-                sig = dict(base.signals)
-                sig.update(d.signals)
-                merged[d.id] = RetrievedDoc(
-                    id=base.id,
-                    score=base.score,
-                    data=base.data,
-                    signals=sig,
-                    derivation=list(base.derivation) + list(d.derivation),
-                )
-            else:
-                merged[d.id] = d
-
-        # Stage 2: Reciprocal Rank Fusion (RRF) on ranks from each retriever list.
-        # score(d) = Σ_i 1 / (rrf_k + rank_i(d)), where rank starts at 1.
-        def _rank_map(docs: List[RetrievedDoc]) -> Dict[int, int]:
-            return {d.id: i for i, d in enumerate(docs, start=1)}
-
-        dense_rank = _rank_map(dense_docs)
-        splade_rank = _rank_map(splade_docs_for_pool)
-
-        def _rrf_score(doc_id: int) -> float:
-            s = 0.0
-            r = dense_rank.get(doc_id)
-            if r is not None:
-                s += 1.0 / (self.rrf_k + r)
-            r = splade_rank.get(doc_id)
-            if r is not None:
-                s += 1.0 / (self.rrf_k + r)
-            return s
-
-        candidates: List[Tuple[RetrievedDoc, float]] = []
-        for d in merged.values():
-            candidates.append((d, _rrf_score(d.id)))
-        candidates.sort(key=lambda t: t[1], reverse=True)
-
-        k_candidates = len(candidates)
-        k_sem = min(self.top_k_semantic, k_candidates)
-        fused_pool = candidates[:k_sem]
-
-        stage2_docs: List[RetrievedDoc] = []
-        for d, s2 in fused_pool:
-            sig = dict(d.signals)
-            sig.update({"rrf_score": float(s2), "rrf_k": int(self.rrf_k)})
-            stage2_docs.append(
-                RetrievedDoc(
-                    id=d.id,
-                    score=float(s2),
-                    data=d.data,
-                    signals=sig,
-                    derivation=list(d.derivation)
-                    + [
-                        {
-                            "method": "rrf",
-                            "rrf_k": int(self.rrf_k),
-                            "top_k_pre": pre_k,
-                            "top_k_candidates": k_candidates,
-                            "top_k_semantic": k_sem,
-                        }
-                    ],
-                )
+            fused = weighted_rrf_fuse(
+                {"splade": splade_docs, "dense": dense_docs},
+                weights={"splade": self.weight_splade_high, "dense": self.weight_dense_high},
+                k=self.wrrf_k,
             )
+            if top_k_final and top_k_final > 0:
+                fused = fused[:top_k_final]
+            self._sem_cache_put(q_emb, fused)
+            logger.debug(f"DynamicFusion HIGH freq key={query_key!r} wrrf fused={len(fused)}")
+            return fused
 
-        out = stage2_docs[:top_k_final] if top_k_final and top_k_final > 0 else stage2_docs
-        logger.debug(
-            f"DynamicFusion(Dense+SPLADE RRF k={self.rrf_k}) "
-            f"candidates={k_candidates} semantic={k_sem} returned={len(out)}"
-        )
+        bm25_docs = self.bm25.retrieve(query, top_k=top_k_bm25_cold)
+        dense_ranked = self.splade_then_dense.rerank_documents(query, bm25_docs)
+        fused = rrf_fuse({"bm25": bm25_docs, "dense_rerank": dense_ranked}, k=self.wrrf_k)
+        out = fused[:top_k_final] if top_k_final > 0 else fused
+        logger.debug(f"DynamicFusion LOW freq key={query_key!r} bm25→dense rrf={len(out)}")
         return out

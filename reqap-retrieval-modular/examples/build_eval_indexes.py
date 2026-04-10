@@ -27,10 +27,6 @@ DEV_JSONL = os.environ.get(
     r"C:\Users\23369\Desktop\final_work\data\retrieve\dev_data.jsonl",
 )
 OBS_CSV = os.path.join(WORKSPACE, "obs.csv")
-# Point directly at official benchmark obs (must match queries.jsonl persona/split):
-#   set PERQA_OBS_CSV=.../dev_persona_0/dev_persona_0_obs.csv
-if os.environ.get("PERQA_OBS_CSV"):
-    OBS_CSV = os.environ["PERQA_OBS_CSV"]
 QUERIES_JSONL = os.path.join(WORKSPACE, "queries.jsonl")
 INDEX_ROOT = os.path.join(WORKSPACE, "indices")
 SPLADE_INDEX = os.path.join(INDEX_ROOT, "splade")

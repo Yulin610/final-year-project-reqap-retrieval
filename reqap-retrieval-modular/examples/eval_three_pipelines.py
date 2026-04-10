@@ -61,8 +61,6 @@ QU_DEV = os.environ.get(
 )
 
 OBS_CSV = os.path.join(WORKSPACE, "obs.csv")
-if os.environ.get("PERQA_OBS_CSV"):
-    OBS_CSV = os.environ["PERQA_OBS_CSV"]
 QUERIES_JSONL = os.path.join(WORKSPACE, "queries.jsonl")
 INDEX_ROOT = os.path.join(WORKSPACE, "indices")
 SPLADE_INDEX = os.path.join(INDEX_ROOT, "splade")
