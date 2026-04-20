@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import inspect
 import json
 import math
 import os
@@ -30,6 +32,9 @@ if str(_EXAMPLES) not in sys.path:
 _MODULAR = _EXAMPLES.parent
 if str(_MODULAR) not in sys.path:
     sys.path.insert(0, str(_MODULAR))
+_LOCAL_DENSE_MODEL = (
+    _EXAMPLES.parent.parent / "ReQAP-main" / "data" / "data" / "models" / "perqa" / "dense_adapted_phase1"
+)
 
 try:
     from omegaconf import OmegaConf
@@ -45,6 +50,7 @@ from perqa_benchmark_paths import (
     reqap_main_root,
 )
 from qu_retrieve_counts import load_or_build_retrieve_query_counts
+from build_eval_indexes import resolved_splade_model_type_or_path
 
 _ROOT_REQAP = reqap_main_root()
 if str(_ROOT_REQAP) not in sys.path:
@@ -63,6 +69,69 @@ from reqap_modular_retrieval.pipelines import (
     SpladeThenDenseRerank,
     DynamicFusionOurs,
 )
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_obs_ids(path: str) -> Set[int]:
+    out: Set[int] = set()
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        rd = csv.DictReader(f)
+        for row in rd:
+            try:
+                out.add(int(row["id"]))
+            except Exception:
+                continue
+    return out
+
+
+def _validate_query_obs_alignment(qs: List[Dict[str, Any]], obs_ids: Set[int]) -> None:
+    missing: Set[int] = set()
+    for q in qs:
+        miss = set(int(x) for x in q["relevant_ids"]) - obs_ids
+        if miss:
+            missing.update(miss)
+    if missing:
+        head = sorted(missing)[:20]
+        raise RuntimeError(
+            f"PerQA query/OBS id mismatch: {len(missing)} relevant ids missing from obs.csv. "
+            f"Example missing ids: {head}"
+        )
+
+
+def _validate_index_meta_if_present(obs_csv: str, splade_index: str, dense_index: str, bm25_index: str, obs_ids: Set[int]) -> None:
+    """
+    If build_eval_indexes wrote index_meta.json under a common workspace root, validate it.
+    """
+    idx = Path(splade_index).resolve()
+    if idx.parent.name != "indices":
+        return
+    meta_path = idx.parent / "index_meta.json"
+    if not meta_path.is_file():
+        return
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    obs_n = len(obs_ids)
+    if int(meta.get("obs_num_docs", -1)) != obs_n:
+        raise RuntimeError(
+            f"index_meta mismatch: obs_num_docs={meta.get('obs_num_docs')} != current obs rows={obs_n}"
+        )
+    try:
+        cur_hash = _sha256_file(obs_csv)
+        if meta.get("obs_sha256") and meta.get("obs_sha256") != cur_hash:
+            raise RuntimeError("index_meta mismatch: obs.csv hash changed. Rebuild indices.")
+    except Exception:
+        pass
+    counts = meta.get("index_doc_counts", {})
+    for k in ("splade", "dense", "bm25"):
+        v = int(counts.get(k, -1))
+        if v > 0 and v != obs_n:
+            raise RuntimeError(f"index_meta mismatch: {k} index docs={v} != obs rows={obs_n}")
 
 
 def load_queries_from_path(path: str) -> List[Dict[str, Any]]:
@@ -158,7 +227,7 @@ def evaluate_model(
         pass
 
     h1, h5, h10, h50 = [], [], [], []
-    mrrs, r50, p10, ndcg10 = [], [], [], []
+    mrrs, r10, r50, p10, ndcg10 = [], [], [], [], []
     times = []
 
     for q in qs:
@@ -173,6 +242,7 @@ def evaluate_model(
         h10.append(hit_at_k(ids, rel, 10))
         h50.append(hit_at_k(ids, rel, 50))
         mrrs.append(mrr(ids, rel, retrieve_k))
+        r10.append(recall_at_k(ids, rel, 10))
         r50.append(recall_at_k(ids, rel, 50))
         p10.append(precision_at_k(ids, rel, 10))
         ndcg10.append(ndcg_at_k(ids, rel, 10))
@@ -189,6 +259,7 @@ def evaluate_model(
         "Hit@10": _safe_mean(h10),
         "Hit@50": _safe_mean(h50),
         "MRR": _safe_mean(mrrs),
+        "Recall@10": _safe_mean(r10),
         "Recall@50": _safe_mean(r50),
         "Precision@10": _safe_mean(p10),
         "NDCG@10": _safe_mean(ndcg10),
@@ -214,6 +285,7 @@ def write_markdown_table(rows: List[Dict[str, Any]], path: str) -> None:
         "Hit@10",
         "Hit@50",
         "MRR",
+        "Recall@10",
         "Recall@50",
         "Precision@10",
         "NDCG@10",
@@ -240,6 +312,27 @@ def write_markdown_table(rows: List[Dict[str, Any]], path: str) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+def write_markdown_task3_focus(rows: List[Dict[str, Any]], path: str) -> None:
+    """Task 3 (PerQA) paper table: Recall@k + NDCG@10."""
+    cols = ["Model", "Recall@10", "Recall@50", "NDCG@10", "Avg. Latency"]
+    lines = []
+    lines.append("| " + " | ".join(cols) + " |")
+    lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
+    for r in rows:
+        cells = []
+        for c in cols:
+            v = r.get(c)
+            if c == "Avg. Latency":
+                cells.append(f"{float(v):.2f} ms" if v is not None else "")
+            elif c == "Model":
+                cells.append(str(v))
+            else:
+                cells.append(_fmt_cell(v) if isinstance(v, float) else str(v))
+        lines.append("| " + " | ".join(cells) + " |")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Eval retrieval on exported PerQA queries.jsonl")
     ap.add_argument("--queries-jsonl", required=True, help="Path from export_queries_jsonl.py")
@@ -249,6 +342,11 @@ def main() -> None:
     ap.add_argument("--splade-index", default="", help="Override SPLADE index dir")
     ap.add_argument("--dense-index", default="", help="Override dense FAISS index dir")
     ap.add_argument("--bm25-index", default="", help="Override BM25 index dir")
+    ap.add_argument(
+        "--dense-model",
+        default="",
+        help="Dense encoder model type/path (overrides PERQA_DENSE_MODEL_TYPE_OR_PATH).",
+    )
     ap.add_argument(
         "--qu-jsonl",
         default="",
@@ -269,7 +367,7 @@ def main() -> None:
     ap.add_argument(
         "--grid-metric",
         default="NDCG@10",
-        choices=["NDCG@10", "MRR", "Hit@10", "Hit@50", "Recall@50", "Precision@10"],
+        choices=["NDCG@10", "MRR", "Hit@10", "Hit@50", "Recall@10", "Recall@50", "Precision@10"],
         help="Metric to maximize when selecting best weights (default: NDCG@10)",
     )
     args = ap.parse_args()
@@ -293,6 +391,13 @@ def main() -> None:
         if not os.path.isdir(p):
             raise SystemExit(f"Missing index directory ({label}): {p}")
 
+    dense_model = os.environ.get("PERQA_DENSE_MODEL_TYPE_OR_PATH") or args.dense_model
+    if not dense_model and _LOCAL_DENSE_MODEL.is_dir():
+        dense_model = str(_LOCAL_DENSE_MODEL)
+        print(f"Using project local dense model: {dense_model}")
+    if not dense_model:
+        dense_model = "sentence-transformers/all-MiniLM-L6-v2"
+
     repo = reqap_main_root()
     folder = persona_folder_name(args.split, args.persona_id)
     qu_default = repo / "data" / "data" / "results" / "perqa" / "reqap_sft" / folder / "qu_result.jsonl"
@@ -307,6 +412,10 @@ def main() -> None:
     qs = load_queries_from_path(str(queries_path))
     if not qs:
         raise SystemExit("No queries loaded.")
+    obs_ids = _load_obs_ids(obs_csv)
+    _validate_query_obs_alignment(qs, obs_ids)
+    _validate_index_meta_if_present(obs_csv, splade_index, dense_index, bm25_index, obs_ids)
+    print(f"Alignment check OK: queries={len(qs)} obs_docs={len(obs_ids)}")
 
     collection = CollectionDataset(data_path=obs_csv)
 
@@ -317,16 +426,20 @@ def main() -> None:
     else:
         print(f"No QU jsonl at {qu_path}; Dynamic Fusion uses empty retrieve_counts.")
 
+    # Match index build: use resolved SPLADE path unless PERQA_SPLADE_MODEL_TYPE_OR_PATH is set to a valid checkpoint.
+    splade_model_override = os.environ.get("PERQA_SPLADE_MODEL_TYPE_OR_PATH", "").strip()
+    _splade_path = splade_model_override if splade_model_override and splade_model_override not in (".",) else resolved_splade_model_type_or_path()
+    print(f"SPLADE model (query encoder): {_splade_path}")
     if OmegaConf is not None:
         splade_cfg = OmegaConf.create(
             {
-                "splade_model_type_or_path": "naver/splade-cocondenser-ensembledistil",
+                "splade_model_type_or_path": _splade_path,
                 "splade_tokenizer_type": "bert-base-uncased",
             }
         )
     else:
         class _Cfg:
-            splade_model_type_or_path = "naver/splade-cocondenser-ensembledistil"
+            splade_model_type_or_path = _splade_path
             splade_tokenizer_type = "bert-base-uncased"
 
         splade_cfg = _Cfg()
@@ -341,7 +454,7 @@ def main() -> None:
     splade = SpladeRetriever(sparse, involve_model=True)
 
     dense_cfg = {
-        "dense_model_type_or_path": "sentence-transformers/all-MiniLM-L6-v2",
+        "dense_model_type_or_path": dense_model,
         "use_sentence_transformers": True,
     }
     dense_native = DenseRetrieval(dense_config=dense_cfg, collection=collection, dense_index_path=dense_index)
@@ -357,13 +470,24 @@ def main() -> None:
         splade=splade, collection=collection, bm25_index_dir=bm25_index, weight_splade=0.7, weight_bm25=0.3
     )
     p_splade_dense_fix = SpladeDenseParallelFusion(splade=splade, dense=dense, weight_splade=0.7, weight_dense=0.3)
-    splade_then_dense = SpladeThenDenseRerank(splade=splade)
+    splade_then_dense = SpladeThenDenseRerank(splade=splade, dense_model_name=dense_model)
+    fw_bm25 = os.environ.get("DYNAMIC_FIXED_W_BM25", "").strip()
+    fw_dense = os.environ.get("DYNAMIC_FIXED_W_DENSE", "").strip()
+    fw_splade = os.environ.get("DYNAMIC_FIXED_W_SPLADE", "").strip()
+    learned_router_model_path = os.environ.get("DYNAMIC_LEARNED_ROUTER_MODEL_PATH", "").strip() or None
+    w1 = float(fw_bm25) if fw_bm25 else None
+    w2 = float(fw_dense) if fw_dense else None
+    w3 = float(fw_splade) if fw_splade else None
     dynamic = DynamicFusionOurs(
         splade=splade,
         dense=dense,
         bm25=bm25,
         splade_then_dense=splade_then_dense,
         retrieve_counts=retrieve_counts,
+        w1_bm25=w1,
+        w2_dense=w2,
+        w3_splade=w3,
+        learned_router_model_path=learned_router_model_path,
     )
 
     specs: List[tuple[str, Callable[[Dict[str, Any]], List[Any]]]] = [
@@ -403,15 +527,28 @@ def main() -> None:
     results_json_path = out_dir / f"{stem}_results_models.json"
     results_csv_path = out_dir / f"{stem}_results_models.csv"
     results_md_path = out_dir / f"{stem}_results_table.md"
+    results_task3_md_path = out_dir / f"{stem}_results_table_task3_perqa.md"
 
     results: List[Dict[str, Any]] = []
 
     # Optionally grid-search DynamicFusion weights (no CE).
     if args.grid_search_dynamic:
+        _gw = ("w1_bm25", "w2_dense", "w3_splade")
+        _missing = tuple(p for p in _gw if p not in inspect.signature(DynamicFusionOurs).parameters)
+        if _missing:
+            raise SystemExit(
+                "DynamicFusionOurs on this machine is too old for --grid-search-dynamic "
+                f"(missing constructor params: {_missing}). "
+                "Overwrite with the repo versions: "
+                "reqap_modular_retrieval/pipelines/dynamic_fusion.py "
+                "and reqap_modular_retrieval/routing/*.py "
+                "(plus fusion/weighted_sum.py + fusion/normalize.py if needed)."
+            )
         grid_rows: List[Dict[str, Any]] = []
-        w_dense_list = [0.4, 0.5, 0.6]
-        w_splade_list = [0.4, 0.5, 0.6]
-        w_bm25_list = [0.0, 0.1]
+        # Grid: w_bm25 ∈ [0.1, 0.3], w_splade ∈ [0.3, 0.6], w_dense ∈ [0.2, 0.5] (step 0.1; fused weights normalized in DynamicFusion).
+        w_bm25_list = [0.1, 0.2, 0.3]
+        w_splade_list = [0.3, 0.4, 0.5, 0.6]
+        w_dense_list = [0.2, 0.3, 0.4, 0.5]
 
         best_row: Optional[Dict[str, Any]] = None
         best_key: Optional[tuple] = None
@@ -479,6 +616,7 @@ def main() -> None:
             "Hit@10",
             "Hit@50",
             "MRR",
+            "Recall@10",
             "Recall@50",
             "Precision@10",
             "NDCG@10",
@@ -527,6 +665,8 @@ def main() -> None:
         "qu_jsonl": str(qu_path) if qu_path.is_file() else None,
         "qu_retrieve_counts_cache": str(qu_cache),
         "retrieve_query_vocab": len(retrieve_counts),
+        "dynamic_fixed_weights": {"bm25": w1, "dense": w2, "splade": w3},
+        "dynamic_learned_router_model_path": learned_router_model_path,
         "num_queries": len(qs),
         "results": results,
     }
@@ -540,6 +680,7 @@ def main() -> None:
         "Hit@10",
         "Hit@50",
         "MRR",
+        "Recall@10",
         "Recall@50",
         "Precision@10",
         "NDCG@10",
@@ -558,8 +699,12 @@ def main() -> None:
             w.writerow(flat)
 
     write_markdown_table(results, str(results_md_path))
+    write_markdown_task3_focus(results, str(results_task3_md_path))
 
-    print(f"\n[Done] JSON: {results_json_path}\n       CSV: {results_csv_path}\n       MD:  {results_md_path}")
+    print(
+        f"\n[Done] JSON: {results_json_path}\n       CSV: {results_csv_path}\n"
+        f"       MD:  {results_md_path}\n       Task3: {results_task3_md_path}"
+    )
 
 
 if __name__ == "__main__":

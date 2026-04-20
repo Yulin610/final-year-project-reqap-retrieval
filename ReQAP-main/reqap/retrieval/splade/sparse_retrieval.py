@@ -58,8 +58,12 @@ class SparseRetrieval:
             else:
                 query_rep = self.create_query_rep(input_ids, self.dim_voc)
             query_rep_nonzero = torch.nonzero(query_rep)
-            # relevant_query_tokens = [self.tokenizer.decode(tid) for tid in query_rep_nonzero]
-            values = query_rep[query_rep_nonzero.squeeze()]
+            # Do not use .squeeze() for indexing: a single nonzero gives a scalar index and a 0-d
+            # query_values array in score_float (IndexError: too many indices for array).
+            if query_rep_nonzero.numel() == 0:
+                return [], []
+            nz_indices = query_rep_nonzero[:, 0]
+            values = query_rep[nz_indices]
             filtered_indexes, scores, derivations = self.score_float(
                 self.index_doc_ids,
                 self.index_doc_values,
@@ -73,18 +77,27 @@ class SparseRetrieval:
                 filtered_indexes, scores, derivations = self.select_topk(filtered_indexes, scores, derivations, k=top_k)
             else:
                 scores = -scores
-            query_result = [{
-                    "id": id_,
-                    "score": score,
-                    "derivation": [{"token": self.tokenizer.decode(m[0]), "score": m[1]} for m in d],
-                    **self.collection[id_]
-                }
-                for id_, score, d in zip(filtered_indexes, scores, derivations)
-            ]
+            # Row index vs global obs id in postings; see CollectionDataset.resolve_splade_doc_ref.
+            query_result = []
+            for id_, score, d in zip(filtered_indexes, scores, derivations):
+                try:
+                    row_i = self.collection.resolve_splade_doc_ref(int(id_))
+                except KeyError:
+                    continue
+                row = self.collection[row_i]
+                query_result.append(
+                    {
+                        "id": row["id"],
+                        "score": score,
+                        "derivation": [{"token": self.tokenizer.decode(m[0]), "score": m[1]} for m in d],
+                        **row,
+                    }
+                )
             query_result = sorted(query_result, key=lambda res: res["score"], reverse=True)
             # compute bag of words representation (useful for gaining insights)
-            col = torch.nonzero(query_rep).squeeze().cpu().tolist()
-            weights = query_rep[col].squeeze().cpu().tolist()
+            nz_bow = torch.nonzero(query_rep)
+            col = nz_bow[:, 0].cpu().tolist()
+            weights = query_rep[nz_bow[:, 0]].cpu().tolist()
             d = {k: v for k, v in zip(col, weights)}
             sorted_d = {k: v for k, v in sorted(d.items(), key=lambda item: item[1], reverse=True)}
             bow_rep = []

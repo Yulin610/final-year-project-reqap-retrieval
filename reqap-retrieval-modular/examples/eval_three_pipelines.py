@@ -3,9 +3,16 @@
 查询频率仅扫描 data/qu/dev_data.jsonl，结果缓存到工作区 qu_dev_retrieve_counts.json（源文件变更后自动重扫）。
 运行前：prepare_retrieve_dev_eval.py → build_eval_indexes.py（或设置 RETRIEVE_EVAL_WORKSPACE）。
 可选环境变量：EVAL_MAX_QUERIES、RETRIEVE_DEV_JSONL、RETRIEVE_EVAL_WORKSPACE、QU_DEV_JSONL、QU_RETRIEVE_COUNTS_CACHE、FORCE_QU_RETRIEVE_COUNTS=1（强制重建频率缓存）。
+
+三套基准（论文 Table 1/2/3）：
+  Task 1 Exact Match：prepare_retrieve_dev_eval 工作区，单标签；聚焦指标 Hit@1 / MRR / Hit@5（RETRIEVE_BENCHMARK_PROFILE=exact）。
+  Task 2 Short Query：build_short_query_eval.py 工作区，按 input[0] 多标签；聚焦 Recall@10/50、NDCG@10、P@10（profile=short）。
+  Task 3 PerQA：eval_perqa_retrieval_export.py（见 RETRIEVAL_BENCHMARKS.md）。
 """
 from __future__ import annotations
 
+import argparse
+import hashlib
 import csv
 import json
 import math
@@ -25,6 +32,7 @@ from omegaconf import OmegaConf
 
 from prepare_retrieve_dev_eval import prepare as prepare_retrieve_workspace
 from qu_retrieve_counts import load_or_build_retrieve_query_counts
+from build_eval_indexes import resolved_splade_model_type_or_path
 
 # ReQAP + 本模块
 _ROOT_REQAP = r"C:\Users\23369\Desktop\final_work\ReQAP-main\ReQAP-main"
@@ -61,6 +69,8 @@ QU_DEV = os.environ.get(
 )
 
 OBS_CSV = os.path.join(WORKSPACE, "obs.csv")
+if os.environ.get("PERQA_OBS_CSV"):
+    OBS_CSV = os.environ["PERQA_OBS_CSV"]
 QUERIES_JSONL = os.path.join(WORKSPACE, "queries.jsonl")
 INDEX_ROOT = os.path.join(WORKSPACE, "indices")
 SPLADE_INDEX = os.path.join(INDEX_ROOT, "splade")
@@ -73,10 +83,74 @@ RESULTS_DIR = WORKSPACE
 RESULTS_JSON_PATH = os.path.join(RESULTS_DIR, "results_models.json")
 RESULTS_CSV_PATH = os.path.join(RESULTS_DIR, "results_models.csv")
 RESULTS_MD_PATH = os.path.join(RESULTS_DIR, "results_table.md")
+RESULTS_MD_TASK1_PATH = os.path.join(RESULTS_DIR, "results_table_task1_exact_match.md")
+RESULTS_MD_TASK2_PATH = os.path.join(RESULTS_DIR, "results_table_task2_short_query.md")
 QU_RETRIEVE_COUNTS_CACHE = os.environ.get(
     "QU_RETRIEVE_COUNTS_CACHE",
     os.path.join(WORKSPACE, "qu_dev_retrieve_counts.json"),
 )
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_obs_ids(path: str) -> Set[int]:
+    out: Set[int] = set()
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        rd = csv.DictReader(f)
+        for row in rd:
+            try:
+                out.add(int(row["id"]))
+            except Exception:
+                continue
+    return out
+
+
+def _validate_query_alignment(qs: List[Dict[str, Any]], obs_ids: Set[int]) -> None:
+    missing_all: Set[int] = set()
+    for q in qs:
+        rel = set(int(x) for x in q["relevant_ids"])
+        miss = rel - obs_ids
+        if miss:
+            missing_all.update(miss)
+    if missing_all:
+        head = sorted(missing_all)[:20]
+        raise RuntimeError(
+            f"Query/OBS id mismatch: {len(missing_all)} relevant_ids are absent from obs.csv. "
+            f"Example missing ids: {head}"
+        )
+
+
+def _validate_workspace_fingerprint(obs_ids: Set[int]) -> None:
+    meta_path = os.path.join(INDEX_ROOT, "index_meta.json")
+    if not os.path.isfile(meta_path):
+        return
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    obs_n = len(obs_ids)
+    if int(meta.get("obs_num_docs", -1)) != obs_n:
+        raise RuntimeError(
+            f"Workspace fingerprint mismatch: meta obs_num_docs={meta.get('obs_num_docs')} "
+            f"!= current obs rows={obs_n}. Rebuild indices."
+        )
+    try:
+        cur_hash = _sha256_file(OBS_CSV)
+        if meta.get("obs_sha256") and meta.get("obs_sha256") != cur_hash:
+            raise RuntimeError("Workspace fingerprint mismatch: obs.csv hash changed. Rebuild indices.")
+    except Exception:
+        pass
+    counts = meta.get("index_doc_counts", {})
+    for k in ("splade", "dense", "bm25"):
+        v = int(counts.get(k, -1))
+        if v > 0 and v != obs_n:
+            raise RuntimeError(
+                f"Index/doc mismatch: {k} index docs={v} != obs rows={obs_n}. Rebuild indices."
+            )
 
 
 def load_queries() -> List[Dict[str, Any]]:
@@ -93,7 +167,7 @@ def load_queries() -> List[Dict[str, Any]]:
                     "qid": row["qid"],
                     "query": row["query"],
                     "query_key": rk,
-                    "relevant_ids": set(row["relevant_ids"]),
+                    "relevant_ids": set(int(x) for x in row["relevant_ids"]),
                 }
             )
     mx = os.environ.get("EVAL_MAX_QUERIES")
@@ -166,7 +240,7 @@ def evaluate_model(model_label: str, retrieve_fn: Callable[[Dict[str, Any]], Lis
         pass
 
     h1, h5, h10, h50 = [], [], [], []
-    mrrs, r50, p10, ndcg10 = [], [], [], []
+    mrrs, r10, r50, p10, ndcg10 = [], [], [], [], []
     times = []
 
     for q in qs:
@@ -181,6 +255,7 @@ def evaluate_model(model_label: str, retrieve_fn: Callable[[Dict[str, Any]], Lis
         h10.append(hit_at_k(ids, rel, 10))
         h50.append(hit_at_k(ids, rel, 50))
         mrrs.append(mrr(ids, rel, RETRIEVE_K))
+        r10.append(recall_at_k(ids, rel, 10))
         r50.append(recall_at_k(ids, rel, 50))
         p10.append(precision_at_k(ids, rel, 10))
         ndcg10.append(ndcg_at_k(ids, rel, 10))
@@ -197,6 +272,7 @@ def evaluate_model(model_label: str, retrieve_fn: Callable[[Dict[str, Any]], Lis
         "Hit@10": _safe_mean(h10),
         "Hit@50": _safe_mean(h50),
         "MRR": _safe_mean(mrrs),
+        "Recall@10": _safe_mean(r10),
         "Recall@50": _safe_mean(r50),
         "Precision@10": _safe_mean(p10),
         "NDCG@10": _safe_mean(ndcg10),
@@ -222,6 +298,7 @@ def write_markdown_table(rows: List[Dict[str, Any]], path: str) -> None:
         "Hit@10",
         "Hit@50",
         "MRR",
+        "Recall@10",
         "Recall@50",
         "Precision@10",
         "NDCG@10",
@@ -248,11 +325,52 @@ def write_markdown_table(rows: List[Dict[str, Any]], path: str) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+def write_markdown_subset(rows: List[Dict[str, Any]], path: str, cols: List[str]) -> None:
+    lines = []
+    lines.append("| " + " | ".join(cols) + " |")
+    lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
+    for r in rows:
+        cells = []
+        for c in cols:
+            v = r.get(c)
+            if c == "GPU Memory":
+                cells.append(f"{v:.2f} GB" if isinstance(v, float) else ("" if v is None else str(v)))
+            elif c == "Avg. Latency":
+                cells.append(f"{float(v):.2f} ms" if v is not None else "")
+            elif c == "Model":
+                cells.append(str(v))
+            else:
+                cells.append(_fmt_cell(v) if isinstance(v, float) else str(v))
+        lines.append("| " + " | ".join(cells) + " |")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Evaluate BM25 / SPLADE / Dense / fusion on retrieve workspace.")
+    parser.add_argument(
+        "--benchmark-profile",
+        default=os.environ.get("RETRIEVE_BENCHMARK_PROFILE", "").strip().lower(),
+        choices=["", "exact", "short"],
+        help="exact → write Task1 focused MD; short → write Task2 focused MD (full table always written).",
+    )
+    args = parser.parse_args()
+    benchmark_profile: str = args.benchmark_profile or ""
+
     os.makedirs(WORKSPACE, exist_ok=True)
-    if not os.path.isfile(OBS_CSV) or not os.path.isfile(QUERIES_JSONL):
+    obs_ok = os.path.isfile(OBS_CSV)
+    q_ok = os.path.isfile(QUERIES_JSONL)
+    if not obs_ok and not q_ok:
         print(f"Preparing workspace from {DEV_JSONL} …")
         prepare_retrieve_workspace(DEV_JSONL, WORKSPACE)
+    elif not obs_ok or not q_ok:
+        print(
+            f"Incomplete workspace: need both obs.csv and queries.jsonl under {WORKSPACE}.\n"
+            f"  Task 1: run prepare_retrieve_dev_eval.py\n"
+            f"  Task 2: run build_short_query_eval.py",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if not os.path.isdir(SPLADE_INDEX) or not os.path.isdir(BM25_INDEX):
         print(
@@ -260,6 +378,11 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+    qs = load_queries()
+    obs_ids = _load_obs_ids(OBS_CSV)
+    _validate_query_alignment(qs, obs_ids)
+    _validate_workspace_fingerprint(obs_ids)
+    print(f"Alignment check OK: queries={len(qs)} obs_docs={len(obs_ids)}")
 
     retrieve_counts = (
         load_or_build_retrieve_query_counts(QU_DEV, QU_RETRIEVE_COUNTS_CACHE)
@@ -273,9 +396,12 @@ def main():
 
     collection = CollectionDataset(data_path=OBS_CSV)
 
+    # Must match the model used when building indices/splade (see build_eval_indexes.py).
+    _splade_path = resolved_splade_model_type_or_path()
+    print(f"SPLADE model (query encoder): {_splade_path}  [set PERQA_SPLADE_MODEL_TYPE_OR_PATH to override]")
     splade_cfg = OmegaConf.create(
         {
-            "splade_model_type_or_path": "naver/splade-cocondenser-ensembledistil",
+            "splade_model_type_or_path": _splade_path,
             "splade_tokenizer_type": "bert-base-uncased",
         }
     )
@@ -289,8 +415,12 @@ def main():
     )
     splade = SpladeRetriever(sparse, involve_model=True)
 
+    dense_model = os.environ.get("PERQA_DENSE_MODEL_TYPE_OR_PATH", "").strip()
+    if not dense_model:
+        dense_model = "sentence-transformers/all-MiniLM-L6-v2"
+    print(f"Dense model (query encoder): {dense_model}  [set PERQA_DENSE_MODEL_TYPE_OR_PATH to override]")
     dense_cfg = {
-        "dense_model_type_or_path": "sentence-transformers/all-MiniLM-L6-v2",
+        "dense_model_type_or_path": dense_model,
         "use_sentence_transformers": True,
     }
     dense_native = DenseRetrieval(dense_config=dense_cfg, collection=collection, dense_index_path=DENSE_INDEX)
@@ -307,13 +437,23 @@ def main():
     )
     p_splade_dense_fix = SpladeDenseParallelFusion(splade=splade, dense=dense, weight_splade=0.7, weight_dense=0.3)
     splade_then_dense = SpladeThenDenseRerank(splade=splade)
+    fw_bm25 = os.environ.get("DYNAMIC_FIXED_W_BM25", "").strip()
+    fw_dense = os.environ.get("DYNAMIC_FIXED_W_DENSE", "").strip()
+    fw_splade = os.environ.get("DYNAMIC_FIXED_W_SPLADE", "").strip()
+    learned_router_model_path = os.environ.get("DYNAMIC_LEARNED_ROUTER_MODEL_PATH", "").strip() or None
+    w1 = float(fw_bm25) if fw_bm25 else None
+    w2 = float(fw_dense) if fw_dense else None
+    w3 = float(fw_splade) if fw_splade else None
     dynamic = DynamicFusionOurs(
         splade=splade,
         dense=dense,
         bm25=bm25,
         splade_then_dense=splade_then_dense,
         retrieve_counts=retrieve_counts,
-        freq_percentile_threshold=75.0,
+        w1_bm25=w1,
+        w2_dense=w2,
+        w3_splade=w3,
+        learned_router_model_path=learned_router_model_path,
     )
 
     specs: List[tuple[str, Callable[[Dict[str, Any]], List[Any]]]] = [
@@ -362,12 +502,15 @@ def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
     out_json = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "benchmark_profile": benchmark_profile or None,
         "workspace": WORKSPACE,
         "dev_jsonl": DEV_JSONL,
         "retrieve_k": RETRIEVE_K,
         "qu_dev_jsonl": QU_DEV,
         "qu_retrieve_counts_cache": QU_RETRIEVE_COUNTS_CACHE,
         "retrieve_query_vocab": len(retrieve_counts),
+        "dynamic_fixed_weights": {"bm25": w1, "dense": w2, "splade": w3},
+        "dynamic_learned_router_model_path": learned_router_model_path,
         "results": results,
     }
     with open(RESULTS_JSON_PATH, "w", encoding="utf-8") as f:
@@ -380,6 +523,7 @@ def main():
         "Hit@10",
         "Hit@50",
         "MRR",
+        "Recall@10",
         "Recall@50",
         "Precision@10",
         "NDCG@10",
@@ -398,6 +542,21 @@ def main():
             w.writerow(flat)
 
     write_markdown_table(results, RESULTS_MD_PATH)
+
+    if benchmark_profile == "exact":
+        write_markdown_subset(
+            results,
+            RESULTS_MD_TASK1_PATH,
+            ["Model", "Hit@1", "MRR", "Hit@5", "Hit@10", "Avg. Latency"],
+        )
+        print(f"       Task1 MD: {RESULTS_MD_TASK1_PATH}")
+    elif benchmark_profile == "short":
+        write_markdown_subset(
+            results,
+            RESULTS_MD_TASK2_PATH,
+            ["Model", "Recall@10", "Recall@50", "NDCG@10", "Precision@10", "MRR", "Avg. Latency"],
+        )
+        print(f"       Task2 MD: {RESULTS_MD_TASK2_PATH}")
 
     print(f"\n[Done] JSON: {RESULTS_JSON_PATH}\n       CSV: {RESULTS_CSV_PATH}\n       MD:  {RESULTS_MD_PATH}")
 

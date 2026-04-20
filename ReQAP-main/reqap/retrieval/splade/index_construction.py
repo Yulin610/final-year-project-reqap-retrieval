@@ -4,6 +4,7 @@ Class to create a sparse index of the provided events.
 import os
 import json
 import pickle
+from typing import Dict
 import torch
 import numpy as np
 import pandas as pd
@@ -16,6 +17,7 @@ from loguru import logger
 
 from reqap.library.library import move_model
 from reqap.library.csv import initialize_csv_reader
+from reqap.library.text import get_doc_text
 from reqap.retrieval.splade.inverted_index import IndexDictOfArray
 from reqap.retrieval.splade.models import Splade
 
@@ -133,6 +135,8 @@ class CollectionDataset(Dataset):
         self.id_dict = {}  # dict storing the whole event (with keys `id`, `date` and `text`)
         self.text_dict = {}  # dict storing only the event_data JSON-strings
         self.data_dict = {}  # dict storing the full data of the event
+        # CSV column `id` (global obs / event id) -> row index. Used when SPLADE postings store obs ids.
+        self._obs_id_to_row: Dict[int, int] = {}
         logger.info(f"Preloading dataset at {data_path}")
 
         # loading dataset
@@ -140,21 +144,47 @@ class CollectionDataset(Dataset):
             reader = initialize_csv_reader(fp)
             for i, row in enumerate(reader):
                 self.id_dict[i] = row["id"]
-                if self.verbalize_events:
-                    self.text_dict[i] = self.verbalize_event_data(row["event_data"])
-                else:
-                    self.text_dict[i] = row["event_data"]
+                # Always normalize event_data to "doc text" consistently:
+                # - if JSON has a "text" field -> use it
+                # - else verbalize as key:value (critical: avoid indexing raw JSON strings)
+                #
+                # Note: We still keep `self.verbalize_events` for backward compatibility, but for SPLADE/BM25
+                # indexing in this project, using raw JSON severely hurts lexical matching.
+                self.text_dict[i] = get_doc_text(row["event_data"], verbalize_fallback=True)
                 self.data_dict[i] = row
+                try:
+                    oid = int(row["id"])
+                    self._obs_id_to_row[oid] = i
+                except (TypeError, ValueError):
+                    pass
         self.collection_size = len(self.id_dict)
 
     def __len__(self):
         return self.collection_size
 
+    def resolve_splade_doc_ref(self, ref: int) -> int:
+        """
+        Map a value from SPLADE posting lists to a dataset row index.
+
+        Standard SPLADE postings use sequential indices ``0 .. collection_size-1``. If an index
+        was built with **global obs ids** in postings, those values are often ``>= collection_size``
+        and are resolved via the CSV ``id`` column (``_obs_id_to_row``).
+
+        When ``ref < collection_size``, it is treated as a row index (normal case).
+        """
+        r = int(ref)
+        if r >= self.collection_size:
+            if r in self._obs_id_to_row:
+                return self._obs_id_to_row[r]
+            raise KeyError(r)
+        return r
+
     def __getitem__(self, idx):
+        i = int(idx)
         return {
-            "id": self.id_dict[idx],
-            "event_data": self.text_dict[idx],
-            "data": self.data_dict[idx]
+            "id": self.id_dict[i],
+            "event_data": self.text_dict[i],
+            "data": self.data_dict[i],
         }
     
     def to_df(self):
